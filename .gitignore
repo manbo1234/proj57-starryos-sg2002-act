@@ -1,0 +1,6 @@
+artifacts/
+*.img
+*.so*
+*.onnx*
+*.bin
+*.tar.gz
