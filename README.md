@@ -13,7 +13,6 @@
 | StarryOS `/dev/cvi-tpu0` 与 `/dev/ion` 支持 | 已完成 |
 | StarryOS 官方 TPU 小模型运行 | 已完成 |
 | StarryOS ACT BF16 TPU 推理 | 已完成 |
-| StarryOS 输出回拷与完整后处理 | 待继续完善 |
 
 ## 技术路线
 
