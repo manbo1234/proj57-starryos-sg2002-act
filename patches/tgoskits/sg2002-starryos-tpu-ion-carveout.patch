@@ -1,0 +1,678 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 1cbe9b7e0..8568f263f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7289,6 +7289,7 @@ version = "0.1.4"
+ dependencies = [
+  "ax-dma",
+  "ax-errno 0.6.0",
++ "ax-hal",
+  "ax-kspin",
+  "ax-memory-addr",
+  "log",
+diff --git a/drivers/tpu/sg2002-tpu/Cargo.toml b/drivers/tpu/sg2002-tpu/Cargo.toml
+index 9baf0fd9a..75870ae1a 100644
+--- a/drivers/tpu/sg2002-tpu/Cargo.toml
++++ b/drivers/tpu/sg2002-tpu/Cargo.toml
+@@ -12,6 +12,7 @@ keywords = ["sg2002", "cvitek", "tpu", "ion"]
+ [dependencies]
+ ax-dma = { workspace = true }
+ ax-errno = { workspace = true }
++ax-hal.workspace = true
+ ax-kspin.workspace = true
+ ax-memory-addr = { workspace = true }
+ log = "0.4"
+diff --git a/drivers/tpu/sg2002-tpu/src/ion/heap.rs b/drivers/tpu/sg2002-tpu/src/ion/heap.rs
+index 83006c45a..e6217a7f1 100644
+--- a/drivers/tpu/sg2002-tpu/src/ion/heap.rs
++++ b/drivers/tpu/sg2002-tpu/src/ion/heap.rs
+@@ -1,16 +1,30 @@
+-//! Ion 堆管理
++//! Ion heap manager.
+ 
+ use alloc::sync::Arc;
+-use core::alloc::Layout;
++use core::{
++    alloc::Layout,
++    ptr::NonNull,
++    sync::atomic::{AtomicUsize, Ordering},
++};
+ 
+ use ax_dma::{self, DMAInfo};
++use ax_hal::mem::{phys_to_virt, PhysAddr};
++use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K};
+ 
+ use super::{
+     error::{IonError, IonResult},
+     types::{IonBuffer, IonHeapType},
+ };
+ 
+-/// Ion 堆管理器
++// Official LicheeRV Nano SG2002 Linux memmap:
++// ION_ADDR = 0x89500000, ION_SIZE = 105 MiB, end = 0x8fe00000.
++const SG2002_ION_CARVEOUT_BASE: usize = 0x8950_0000;
++const SG2002_ION_CARVEOUT_SIZE: usize = 105 * 1024 * 1024;
++const SG2002_ION_CARVEOUT_END: usize = SG2002_ION_CARVEOUT_BASE + SG2002_ION_CARVEOUT_SIZE;
++
++static CARVEOUT_NEXT: AtomicUsize = AtomicUsize::new(SG2002_ION_CARVEOUT_BASE);
++static CARVEOUT_LIVE: AtomicUsize = AtomicUsize::new(0);
++
+ pub struct IonHeapManager;
+ 
+ impl Default for IonHeapManager {
+@@ -20,53 +34,122 @@ impl Default for IonHeapManager {
+ }
+ 
+ impl IonHeapManager {
+-    /// 创建新的堆管理器
+     pub const fn new() -> Self {
+         Self
+     }
+ 
+-    /// 从指定堆分配缓冲区
+     pub fn alloc_buffer(
+         &self,
+         size: usize,
+         align: usize,
+         heap_type: IonHeapType,
+     ) -> IonResult<Arc<IonBuffer>> {
+-        debug!(
+-            "Allocating Ion buffer: size={}, align={}, heap_type={:?}",
++        info!(
++            "ION alloc_buffer request: size={}, align={}, heap_type={:?}",
+             size, align, heap_type
+         );
+-        // 校验参数
++
+         if size == 0 {
+             return Err(IonError::InvalidArg);
+         }
+ 
+         let dma_info = match heap_type {
+-            IonHeapType::System => {
+-                // 系统堆使用普通的 DMA 内存
+-                self.alloc_dma_buffer(size, align)?
+-            }
+-            IonHeapType::DmaCoherent => {
+-                // DMA coherent 堆
+-                self.alloc_dma_buffer(size, align)?
+-            }
+-            IonHeapType::Carveout => {
+-                // Carveout 堆暂时不支持，使用 DMA 内存代替
+-                warn!("Carveout heap not implemented, using DMA heap instead");
+-                self.alloc_dma_buffer(size, align)?
+-            }
++            IonHeapType::System | IonHeapType::DmaCoherent => self.alloc_dma_buffer(size, align)?,
++            IonHeapType::Carveout => alloc_carveout_buffer(size, align)?,
+         };
+ 
+-        let buffer = Arc::new(IonBuffer::new(dma_info, size));
++        let buffer = Arc::new(IonBuffer::new_with_heap(dma_info, size, heap_type));
+         debug!("Allocated Ion buffer with handle: {:?}", buffer.handle);
+ 
+         Ok(buffer)
+     }
+ 
+-    /// 分配 DMA 内存
+     fn alloc_dma_buffer(&self, size: usize, align: usize) -> IonResult<DMAInfo> {
+         let layout = Layout::from_size_align(size, align).map_err(|_| IonError::InvalidArg)?;
+ 
+-        unsafe { ax_dma::alloc_coherent_pages(layout).map_err(|_| IonError::NoMemory) }
++        info!(
++            "ION DMA alloc_coherent_pages start: size={}, align={}, layout_size={}, layout_align={}",
++            size,
++            align,
++            layout.size(),
++            layout.align()
++        );
++        let dma_info =
++            unsafe { ax_dma::alloc_coherent_pages(layout).map_err(|_| IonError::NoMemory)? };
++        info!(
++            "ION DMA alloc_coherent_pages done: size={}, bus_addr=0x{:x}, cpu_addr=0x{:x}",
++            size,
++            dma_info.bus_addr.as_u64(),
++            dma_info.cpu_addr.as_ptr() as usize
++        );
++        Ok(dma_info)
++    }
++}
++
++fn align_up_checked(value: usize, align: usize) -> IonResult<usize> {
++    let align = align
++        .max(1)
++        .checked_next_power_of_two()
++        .ok_or(IonError::InvalidArg)?;
++    let mask = align - 1;
++    value
++        .checked_add(mask)
++        .map(|v| v & !mask)
++        .ok_or(IonError::NoMemory)
++}
++
++fn alloc_carveout_buffer(size: usize, align: usize) -> IonResult<DMAInfo> {
++    let effective_align = align.max(PAGE_SIZE_4K);
++    let alloc_size = align_up_checked(size, PAGE_SIZE_4K)?;
++
++    loop {
++        let current = CARVEOUT_NEXT.load(Ordering::Acquire);
++        let start = align_up_checked(current, effective_align)?;
++        let end = start.checked_add(alloc_size).ok_or(IonError::NoMemory)?;
++
++        if end > SG2002_ION_CARVEOUT_END {
++            error!(
++                "ION carveout exhausted: request_size={}, alloc_size={}, current=0x{:x}, end=0x{:x}, limit=0x{:x}",
++                size, alloc_size, current, end, SG2002_ION_CARVEOUT_END
++            );
++            return Err(IonError::NoMemory);
++        }
++
++        if CARVEOUT_NEXT
++            .compare_exchange(current, end, Ordering::AcqRel, Ordering::Acquire)
++            .is_err()
++        {
++            continue;
++        }
++
++        let paddr = PhysAddr::from_usize(start);
++        let vaddr = phys_to_virt(paddr);
++        let cpu_addr = NonNull::new(vaddr.as_mut_ptr()).ok_or(IonError::NoMemory)?;
++        let live = CARVEOUT_LIVE.fetch_add(1, Ordering::AcqRel) + 1;
++
++        info!(
++            "ION carveout alloc: size={}, alloc_size={}, paddr=0x{:x}, vaddr=0x{:x}, next=0x{:x}, live={}",
++            size,
++            alloc_size,
++            paddr.as_usize(),
++            vaddr.as_usize(),
++            end,
++            live
++        );
++
++        return Ok(DMAInfo {
++            cpu_addr,
++            bus_addr: ax_dma::phys_to_bus(paddr),
++        });
++    }
++}
++
++pub fn release_carveout_buffer() {
++    let old = CARVEOUT_LIVE.fetch_sub(1, Ordering::AcqRel);
++    if old == 0 {
++        CARVEOUT_LIVE.store(0, Ordering::Release);
++    } else if old == 1 {
++        CARVEOUT_NEXT.store(SG2002_ION_CARVEOUT_BASE, Ordering::Release);
++        info!("ION carveout reset: all carveout buffers released");
+     }
+ }
+diff --git a/drivers/tpu/sg2002-tpu/src/ion/types.rs b/drivers/tpu/sg2002-tpu/src/ion/types.rs
+index 53b830ae6..6e1c2035e 100644
+--- a/drivers/tpu/sg2002-tpu/src/ion/types.rs
++++ b/drivers/tpu/sg2002-tpu/src/ion/types.rs
+@@ -64,20 +64,30 @@ pub struct IonBuffer {
+     pub dma_info: DMAInfo,
+     /// 缓冲区大小
+     pub size: usize,
++    pub heap_type: IonHeapType,
+ }
+ 
+ impl IonBuffer {
+     pub fn new(dma_info: DMAInfo, size: usize) -> Self {
++        Self::new_with_heap(dma_info, size, IonHeapType::DmaCoherent)
++    }
++
++    pub fn new_with_heap(dma_info: DMAInfo, size: usize, heap_type: IonHeapType) -> Self {
+         Self {
+             handle: IonHandle::new(),
+             dma_info,
+             size,
++            heap_type,
+         }
+     }
+ }
+ 
+ impl Drop for IonBuffer {
+     fn drop(&mut self) {
++        if self.heap_type == IonHeapType::Carveout {
++            crate::ion::heap::release_carveout_buffer();
++            return;
++        }
+         // 最后一个 `Arc<IonBuffer>` 被释放时，物理页才交还给 DMA 分配器，
+         // 以避免 fd / mmap 还存活时交还后被另一路 DMA 者重复占用。
+         match Layout::from_size_align(self.size, PAGE_SIZE_4K) {
+diff --git a/os/StarryOS/kernel/src/file/mod.rs b/os/StarryOS/kernel/src/file/mod.rs
+index d78146dce..928ad38e8 100644
+--- a/os/StarryOS/kernel/src/file/mod.rs
++++ b/os/StarryOS/kernel/src/file/mod.rs
+@@ -3,7 +3,7 @@ pub mod event;
+ mod fs;
+ pub mod inotify;
+ pub mod io_uring;
+-#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
++#[cfg(feature = "sg2002")]
+ pub mod ion;
+ pub mod memfd;
+ mod net;
+diff --git a/os/StarryOS/kernel/src/mm/aspace/backend/linear.rs b/os/StarryOS/kernel/src/mm/aspace/backend/linear.rs
+index d2ee7bc33..6c9ef182b 100644
+--- a/os/StarryOS/kernel/src/mm/aspace/backend/linear.rs
++++ b/os/StarryOS/kernel/src/mm/aspace/backend/linear.rs
+@@ -52,7 +52,9 @@ impl BackendOps for LinearBackend {
+     fn map(&self, range: VirtAddrRange, flags: MappingFlags, pt: &mut PageTableCursor) -> AxResult {
+         let pa_range = PhysAddrRange::from_start_size(self.pa(range.start), range.size());
+         debug!("Linear::map: {range:?} -> {pa_range:?} {flags:?}");
+-        pt.map_region(range.start, |va| self.pa(va), range.size(), flags, false)?;
++        for vaddr in pages_in(range, PageSize::Size4K)? {
++            pt.map(vaddr, self.pa(vaddr), PageSize::Size4K, flags)?;
++        }
+         Ok(())
+     }
+ 
+@@ -69,6 +71,41 @@ impl BackendOps for LinearBackend {
+         Ok(())
+     }
+ 
++    fn populate(
++        &self,
++        range: VirtAddrRange,
++        flags: MappingFlags,
++        access_flags: MappingFlags,
++        pt: &mut PageTableCursor,
++    ) -> AxResult<(usize, Option<super::PopulateCallback>)> {
++        let mut populated = 0;
++        for vaddr in pages_in(range, PageSize::Size4K)? {
++            match pt.query(vaddr) {
++                Ok((paddr, page_flags, page_size)) => {
++                    if page_size == PageSize::Size4K && page_flags.contains(access_flags) {
++                        populated += 1;
++                    } else if page_size == PageSize::Size4K {
++                        pt.remap(vaddr, paddr, flags)?;
++                        populated += 1;
++                    }
++                }
++                Err(PagingError::NotMapped) => {
++                    match pt.map(vaddr, self.pa(vaddr), PageSize::Size4K, flags) {
++                        Ok(()) | Err(PagingError::AlreadyMapped) => {
++                            populated += 1;
++                        }
++                        Err(err) => return Err(err.into()),
++                    }
++                }
++                Err(PagingError::AlreadyMapped) => {
++                    populated += 1;
++                }
++                Err(err) => return Err(err.into()),
++            }
++        }
++        Ok((populated, None))
++    }
++
+     fn clone_map(
+         &self,
+         _range: VirtAddrRange,
+diff --git a/os/StarryOS/kernel/src/pseudofs/dev/ion/device.rs b/os/StarryOS/kernel/src/pseudofs/dev/ion/device.rs
+index c539cc2c7..caaefc674 100644
+--- a/os/StarryOS/kernel/src/pseudofs/dev/ion/device.rs
++++ b/os/StarryOS/kernel/src/pseudofs/dev/ion/device.rs
+@@ -105,11 +105,15 @@ impl IonDevice {
+     fn handle_free(&self, user_ptr: usize) -> VfsResult<usize> {
+         debug!("Processing ION_IOC_FREE");
+ 
+-        // 从用户空间读取句柄数据
+-        let handle_data = unsafe {
+-            (user_ptr as *const IonHandleData)
+-                .vm_read_uninit()?
+-                .assume_init()
++        // ION_IOC_FREE may receive either a normal user pointer or a kernel
++        // buffer pointer prepared by the ioctl/cleanup path.
++        let handle_data = match unsafe { (user_ptr as *const IonHandleData).vm_read_uninit() } {
++            Ok(data) => unsafe { data.assume_init() },
++            Err(_) if user_ptr >= 0xffff_ffc0_0000_0000 => {
++                info!("ION_IOC_FREE: using kernel buffer arg=0x{:x}", user_ptr);
++                unsafe { core::ptr::read_unaligned(user_ptr as *const IonHandleData) }
++            }
++            Err(err) => return Err(err.into()),
+         };
+ 
+         let handle = IonHandle(handle_data.handle);
+@@ -253,7 +257,8 @@ impl DeviceOps for IonDevice {
+     }
+ 
+     fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+-        match cmd {
++        info!("ION ioctl enter: cmd=0x{:x}, arg=0x{:x}", cmd, arg);
++        let result = match cmd {
+             ION_IOC_HEAP_QUERY => self.handle_heap_query(arg),
+             ION_IOC_ALLOC => self.handle_alloc(arg),
+             ION_IOC_FREE => self.handle_free(arg),
+@@ -262,7 +267,12 @@ impl DeviceOps for IonDevice {
+                 warn!("Unsupported Ion ioctl command: 0x{:x}", cmd);
+                 Err(AxError::Unsupported)
+             }
++        };
++        match &result {
++            Ok(v) => info!("ION ioctl exit: cmd=0x{:x}, ret={}", cmd, v),
++            Err(e) => error!("ION ioctl error: cmd=0x{:x}, err={:?}", cmd, e),
+         }
++        result
+     }
+ 
+     fn as_any(&self) -> &dyn Any {
+diff --git a/os/StarryOS/kernel/src/pseudofs/dev/mod.rs b/os/StarryOS/kernel/src/pseudofs/dev/mod.rs
+index ade86a203..d832c3aeb 100644
+--- a/os/StarryOS/kernel/src/pseudofs/dev/mod.rs
++++ b/os/StarryOS/kernel/src/pseudofs/dev/mod.rs
+@@ -18,14 +18,14 @@ mod r#loop;
+ mod loop_block;
+ #[cfg(feature = "ext4")]
+ pub use r#loop::LoopDevice;
+-#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
++#[cfg(feature = "sg2002")]
+ pub mod ion;
+ #[cfg(feature = "memtrack")]
+ mod memtrack;
+ #[cfg(feature = "rknpu")]
+ mod rknpu_drm;
+ mod rtc;
+-#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
++#[cfg(feature = "sg2002")]
+ pub mod tpu;
+ pub mod tty;
+ 
+@@ -46,10 +46,10 @@ use core::any::Any;
+ use ax_errno::AxError;
+ use ax_sync::Mutex;
+ use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsResult};
+-#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
++#[cfg(feature = "sg2002")]
+ use spin::Once;
+ 
+-#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
++#[cfg(feature = "sg2002")]
+ pub static ION_DEVICE: Once<Arc<ion::IonDevice>> = Once::new();
+ #[cfg(feature = "dev-log")]
+ pub use log::bind_dev_log;
+@@ -417,6 +417,32 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
+         SimpleDir::new_maker(fs.clone(), Arc::new(event::input_devices(fs.clone()))),
+     );
+ 
++    #[cfg(all(feature = "sg2002", feature = "plat-dyn"))]
++    {
++        root.add(
++            "cvi-tpu0",
++            Device::new(
++                fs.clone(),
++                NodeType::CharacterDevice,
++                DeviceId::new(240, 0),
++                Arc::new(unsafe { tpu::TpuDevice::new() }),
++            ),
++        );
++
++        let ion_device = Arc::new(ion::IonDevice::new());
++        ION_DEVICE.call_once(|| ion_device.clone());
++
++        root.add(
++            "ion",
++            Device::new(
++                fs.clone(),
++                NodeType::CharacterDevice,
++                DeviceId::new(10, 56),
++                ion_device,
++            ),
++        );
++    }
++
+     #[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
+     {
+         root.add(
+diff --git a/os/StarryOS/kernel/src/pseudofs/dev/tpu/device.rs b/os/StarryOS/kernel/src/pseudofs/dev/tpu/device.rs
+index eacb27259..b37fa9017 100644
+--- a/os/StarryOS/kernel/src/pseudofs/dev/tpu/device.rs
++++ b/os/StarryOS/kernel/src/pseudofs/dev/tpu/device.rs
+@@ -112,15 +112,25 @@ impl TpuDevice {
+     /// 刷新 DMA buffer 缓存 (通过物理地址)
+     fn cache_flush(&self, arg: usize) -> Result<usize, TpuError> {
+         let flush_arg = unsafe { &*(arg as *const CviCacheOpArg) };
++        info!(
++            "TPU cache_flush: paddr=0x{:x}, size={}",
++            flush_arg.paddr, flush_arg.size
++        );
+         self.hw.cache_flush_paddr(flush_arg.paddr, flush_arg.size)?;
++        info!("TPU cache_flush done");
+         Ok(0)
+     }
+ 
+     /// 无效化 DMA buffer 缓存 (通过物理地址)
+     fn cache_invalidate(&self, arg: usize) -> Result<usize, TpuError> {
+         let invalidate_arg = unsafe { &*(arg as *const CviCacheOpArg) };
++        info!(
++            "TPU cache_invalidate: paddr=0x{:x}, size={}",
++            invalidate_arg.paddr, invalidate_arg.size
++        );
+         self.hw
+             .cache_invalidate_paddr(invalidate_arg.paddr, invalidate_arg.size)?;
++        info!("TPU cache_invalidate done");
+         Ok(0)
+     }
+ 
+@@ -176,7 +186,7 @@ impl DeviceOps for TpuDevice {
+     }
+ 
+     fn ioctl(&self, cmd: u32, arg: usize) -> axfs_ng_vfs::VfsResult<usize> {
+-        debug!("TPU ioctl: cmd=0x{:x}, arg=0x{:x}", cmd, arg);
++        info!("TPU ioctl enter: cmd=0x{:x}, arg=0x{:x}", cmd, arg);
+ 
+         let result = match cmd {
+             CVITPU_SUBMIT_DMABUF => self.submit_dmabuf(arg),
+diff --git a/os/StarryOS/kernel/src/pseudofs/proc.rs b/os/StarryOS/kernel/src/pseudofs/proc.rs
+index adb75343e..fdc4c8fcb 100644
+--- a/os/StarryOS/kernel/src/pseudofs/proc.rs
++++ b/os/StarryOS/kernel/src/pseudofs/proc.rs
+@@ -585,6 +585,48 @@ impl SimpleDirOps for ThreadFdDir {
+     }
+ }
+ 
++
++/// The /proc/[pid]/fdinfo directory
++struct ThreadFdInfoDir {
++    fs: Arc<SimpleFs>,
++    task: WeakAxTaskRef,
++}
++
++impl SimpleDirOps for ThreadFdInfoDir {
++    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
++        let Some(task) = self.task.upgrade() else {
++            return Box::new(iter::empty());
++        };
++        let ids = FD_TABLE
++            .scope(&task.as_thread().proc_data.scope.read())
++            .read()
++            .ids()
++            .map(|id| Cow::Owned(id.to_string()))
++            .collect::<Vec<_>>();
++        Box::new(ids.into_iter())
++    }
++
++    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
++        let fs = self.fs.clone();
++        let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
++        let fd = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
++        FD_TABLE
++            .scope(&task.as_thread().proc_data.scope.read())
++            .read()
++            .get(fd as _)
++            .ok_or(VfsError::NotFound)?;
++
++        Ok(SimpleFile::new_regular(fs, move || {
++            Ok(format!("pos:\t0\nflags:\t02\nmnt_id:\t0\nino:\t{}\n", fd))
++        })
++        .into())
++    }
++
++    fn is_cacheable(&self) -> bool {
++        false
++    }
++}
++
+ /// The /proc/[pid]/ns directory — namespace entries.
+ ///
+ /// Each entry is a regular file displaying the namespace identifier.
+@@ -859,6 +901,7 @@ impl SimpleDirOps for ThreadDir {
+                 "comm",
+                 "exe",
+                 "fd",
++                "fdinfo",
+                 "uid_map",
+                 "gid_map",
+                 "setgroups",
+@@ -1024,6 +1067,14 @@ impl SimpleDirOps for ThreadDir {
+                 }),
+             )
+             .into(),
++            "fdinfo" => SimpleDir::new_maker(
++                fs.clone(),
++                Arc::new(ThreadFdInfoDir {
++                    fs,
++                    task: Arc::downgrade(&task),
++                }),
++            )
++            .into(),
+             "uid_map" => SimpleFile::new_regular(
+                 fs,
+                 RwFile::new(move |req| match req {
+diff --git a/os/StarryOS/kernel/src/syscall/fs/io.rs b/os/StarryOS/kernel/src/syscall/fs/io.rs
+index b8e555038..d97461e4e 100644
+--- a/os/StarryOS/kernel/src/syscall/fs/io.rs
++++ b/os/StarryOS/kernel/src/syscall/fs/io.rs
+@@ -122,7 +122,41 @@ pub fn sys_dummy_fd(sysno: Sysno) -> AxResult<isize> {
+ /// Return the read size if success.
+ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
+     debug!("sys_read <= fd: {fd}, buf: {buf:p}, len: {len}");
+-    Ok(get_file_like(fd)?.read(&mut VmBytesMut::new(buf, len))? as _)
++
++    const READ_CHUNK: usize = 1024 * 1024;
++
++    if len > READ_CHUNK {
++        info!("sys_read chunked enter: fd={fd}, len={len}");
++        let file = get_file_like(fd)?;
++        let mut total = 0usize;
++
++        while total < len {
++            let chunk = core::cmp::min(READ_CHUNK, len - total);
++            let ptr = unsafe { buf.add(total) };
++            let n = file.read(&mut VmBytesMut::new(ptr, chunk))?;
++            total += n;
++
++            if total % (16 * READ_CHUNK) == 0 || n == 0 || total == len {
++                info!("sys_read chunked progress: fd={fd}, total={total}, len={len}, last={n}");
++            }
++
++            if n == 0 || n < chunk {
++                break;
++            }
++        }
++
++        info!("sys_read chunked exit: fd={fd}, len={len}, ret={total}");
++        return Ok(total as _);
++    }
++
++    if len >= 65536 {
++        info!("sys_read large enter: fd={fd}, len={len}");
++    }
++    let ret = get_file_like(fd)?.read(&mut VmBytesMut::new(buf, len))?;
++    if len >= 65536 {
++        info!("sys_read large exit: fd={fd}, len={len}, ret={ret}");
++    }
++    Ok(ret as _)
+ }
+ 
+ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
+@@ -432,7 +466,13 @@ pub fn sys_pread64(fd: c_int, buf: *mut u8, len: usize, offset: __kernel_off_t)
+     if offset < 0 {
+         return Err(AxError::InvalidInput);
+     }
++    if len >= 65536 {
++        info!("sys_pread64 large enter: fd={fd}, len={len}, offset={offset}");
++    }
+     let read = f.inner().read_at(VmBytesMut::new(buf, len), offset as _)?;
++    if len >= 65536 {
++        info!("sys_pread64 large exit: fd={fd}, len={len}, offset={offset}, ret={read}");
++    }
+     Ok(read as _)
+ }
+ 
+diff --git a/os/StarryOS/kernel/src/syscall/mm/mmap.rs b/os/StarryOS/kernel/src/syscall/mm/mmap.rs
+index 4b3967234..2c623f03f 100644
+--- a/os/StarryOS/kernel/src/syscall/mm/mmap.rs
++++ b/os/StarryOS/kernel/src/syscall/mm/mmap.rs
+@@ -264,7 +264,7 @@ pub fn sys_mmap(
+ 
+     // IonBufferFile 特殊处理：直接线性映射物理地址，跳过通用 file_mmap/device_mmap 路径。
+     // 这样可以避免通用路径中 `range.start += offset` 对 Ion buffer 的错误偏移。
+-    #[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
++    #[cfg(feature = "sg2002")]
+     if let Some(ref file) = file {
+         use crate::file::ion::IonBufferFile;
+         if let Some(ion_file) = file.downcast_ref::<IonBufferFile>() {
+@@ -292,15 +292,16 @@ pub fn sys_mmap(
+                 );
+                 return Err(AxError::InvalidInput);
+             }
+-            let mut ion_mapping_flags: MappingFlags = permission_flags.into();
+-            ion_mapping_flags |= MappingFlags::UNCACHED;
++            // Keep Ion user mapping cached; Cvitek runtime issues cache flush/invalidate ioctls.
++            let ion_mapping_flags: MappingFlags = permission_flags.into();
+             let backend = Backend::new_linear_anchored(
+                 start,
+                 start.as_usize() as isize - range.start.as_usize() as isize,
+                 true,
+                 ion_file.buffer().clone(),
+             );
+-            let populate = map_flags.contains(MmapFlags::POPULATE);
++            // Ion DMA buffers must be mapped eagerly; LinearBackend has no lazy populate path.
++            let populate = true;
+             aspace.map(start, map_length, ion_mapping_flags, populate, backend)?;
+             info!(
+                 "Ion buffer mmap success: vaddr=0x{:x}, length={}",
+diff --git a/os/arceos/modules/axfs-ng/src/highlevel/file.rs b/os/arceos/modules/axfs-ng/src/highlevel/file.rs
+index 6ab417acc..4e29a21bb 100644
+--- a/os/arceos/modules/axfs-ng/src/highlevel/file.rs
++++ b/os/arceos/modules/axfs-ng/src/highlevel/file.rs
+@@ -253,9 +253,12 @@ impl OpenOptions {
+                 || self.path
+                 || self.direct
+                 || loc.flags().contains(NodeFlags::NON_CACHEABLE);
+-            let backend = if !direct || loc.flags().contains(NodeFlags::ALWAYS_CACHE) {
++            // SG2002 ACT debug: bypass LRU page cache for normal files,
++            // but keep ALWAYS_CACHE nodes (tmpfs/pseudofs) on cached backend.
++            let backend = if loc.flags().contains(NodeFlags::ALWAYS_CACHE) {
+                 FileBackend::new_cached(loc)
+             } else {
++                let _ = direct;
+                 FileBackend::new_direct(loc)
+             };
+             OpenResult::File(File::new(backend, flags))
+diff --git a/platforms/axplat-dyn/src/mem.rs b/platforms/axplat-dyn/src/mem.rs
+index 6ed920520..daf63934e 100644
+--- a/platforms/axplat-dyn/src/mem.rs
++++ b/platforms/axplat-dyn/src/mem.rs
+@@ -21,6 +21,11 @@ const X86_RESERVED_RAM_RANGES: &[RawRange] = &[
+     (0, 0x20_0000),
+ ];
+ 
++// SG2002/LicheeRV Nano ION carveout used by Cvitek TPU runtime.
++// Keep it out of the normal RAM allocator.
++#[cfg(all(target_arch = "riscv64", feature = "thead-mae"))]
++const SG2002_ION_CARVEOUT_RANGE: RawRange = (0x8950_0000, 0x0690_0000);
++
+ struct MemIfImpl;
+ 
+ fn push_non_overlapping<const N: usize>(list: &mut Vec<RawRange, N>, range: RawRange) {
+@@ -78,6 +83,8 @@ impl MemIf for MemIfImpl {
+             for &range in X86_RESERVED_RAM_RANGES {
+                 push_non_overlapping(&mut list, range);
+             }
++            #[cfg(all(target_arch = "riscv64", feature = "thead-mae"))]
++            push_non_overlapping(&mut list, SG2002_ION_CARVEOUT_RANGE);
+             for r in somehal::mem::memory_map() {
+                 if matches!(
+                     r.memory_type,
