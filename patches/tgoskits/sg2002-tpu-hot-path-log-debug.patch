@@ -1,0 +1,52 @@
+diff --git a/os/StarryOS/kernel/src/pseudofs/dev/tpu/device.rs b/os/StarryOS/kernel/src/pseudofs/dev/tpu/device.rs
+index eacb27259..557ac5db1 100644
+--- a/os/StarryOS/kernel/src/pseudofs/dev/tpu/device.rs
++++ b/os/StarryOS/kernel/src/pseudofs/dev/tpu/device.rs
+@@ -1,3 +1,4 @@
++
+ //! TPU 设备 OS 适配
+ //!
+ //! 将 ioctl 命令翻译为 `Sg2002Tpu` 调用，并通过 fd 解析 Ion buffer
+@@ -9,6 +10,7 @@ use sg2002_tpu::{
+     ion::IonBuffer,
+     tpu::{
+         Sg2002Tpu,
++
+         error::TpuError,
+         types::{
+             CVITPU_DMABUF_FLUSH, CVITPU_DMABUF_FLUSH_FD, CVITPU_DMABUF_INVLD,
+@@ -112,15 +114,25 @@ impl TpuDevice {
+     /// 刷新 DMA buffer 缓存 (通过物理地址)
+     fn cache_flush(&self, arg: usize) -> Result<usize, TpuError> {
+         let flush_arg = unsafe { &*(arg as *const CviCacheOpArg) };
++        debug!(
++            "TPU cache_flush: paddr=0x{:x}, size={}",
++            flush_arg.paddr, flush_arg.size
++        );
+         self.hw.cache_flush_paddr(flush_arg.paddr, flush_arg.size)?;
++        debug!("TPU cache_flush done");
+         Ok(0)
+     }
+ 
+     /// 无效化 DMA buffer 缓存 (通过物理地址)
+     fn cache_invalidate(&self, arg: usize) -> Result<usize, TpuError> {
+         let invalidate_arg = unsafe { &*(arg as *const CviCacheOpArg) };
++        debug!(
++            "TPU cache_invalidate: paddr=0x{:x}, size={}",
++            invalidate_arg.paddr, invalidate_arg.size
++        );
+         self.hw
+             .cache_invalidate_paddr(invalidate_arg.paddr, invalidate_arg.size)?;
++        debug!("TPU cache_invalidate done");
+         Ok(0)
+     }
+ 
+@@ -176,7 +188,7 @@ impl DeviceOps for TpuDevice {
+     }
+ 
+     fn ioctl(&self, cmd: u32, arg: usize) -> axfs_ng_vfs::VfsResult<usize> {
+-        debug!("TPU ioctl: cmd=0x{:x}, arg=0x{:x}", cmd, arg);
++        debug!("TPU ioctl enter: cmd=0x{:x}, arg=0x{:x}", cmd, arg);
+ 
+         let result = match cmd {
+             CVITPU_SUBMIT_DMABUF => self.submit_dmabuf(arg),
