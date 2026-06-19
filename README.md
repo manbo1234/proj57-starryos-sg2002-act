@@ -184,13 +184,42 @@ Outputs:
 Task exit with code: 0
 ```
 
-性能记录：
+性能记录（优化前，TPU 热路径 info 日志开启）：
 
 ```text
 run1: 239.647 ms, 4.172804 FPS
 run2: 239.683 ms, 4.172177 FPS
 avg : 239.665 ms, 4.1725 FPS
 ```
+
+### StarryOS TPU 热路径日志优化
+
+进一步用 `--count 3 --enable-timer --verbose 0` 测试时发现，`--verbose 0` 只能关闭 `model_runner` 用户态输出，不能关闭 StarryOS 内核 TPU 设备路径中的 `info!` 日志。优化前，每次推理都会在热路径中输出：
+
+```text
+TPU ioctl enter
+TPU cache_flush
+TPU cache_flush done
+TPU cache_invalidate
+TPU cache_invalidate done
+```
+
+这些串口日志位于每轮 TPU 推理的 cache flush、任务提交和 cache invalidate 路径中，会被计入 `model_runner` 的单次推理耗时。优化方式是在 `tgoskits` 的：
+
+```text
+os/StarryOS/kernel/src/pseudofs/dev/tpu/device.rs
+```
+
+中将上述 TPU 热路径日志从 `info!` 降为 `debug!`，只修改日志级别，不修改 TPU 提交、cache flush 或 cache invalidate 的实际逻辑。
+
+优化前后性能对比：
+
+```text
+before: 3 runs take 713.305 ms, each run takes 237.768000 ms, fps 4.205780
+after : 3 runs take 253.313 ms, each run takes  84.437000 ms, fps 11.843149
+```
+
+因此，StarryOS 上此前约 240 ms 的 ACT BF16 推理耗时主要由 TPU 热路径内核日志污染导致。关闭热路径 `info!` 日志后，ACT BF16 `cvimodel` 在 SG2002 StarryOS 上的推理速度达到约 84 ms/run，接近 SG2002 官方 Linux 上约 83 ms/run 的结果。
 
 ## 板端内存占用
 
@@ -256,7 +285,7 @@ rootfs*
 3. 将 `action [1,8,3]` 接回 ACT 后处理逻辑，恢复最终 left/right 方向判断。
 4. 继续整理 StarryOS 侧 TPU / ION / carveout 修改，形成更干净的补丁。
 5. 后续实现更完整的 carveout heap。
-6. 后续尝试优化 BF16 推理链路，减少模型加载、ION buffer 分配和输入输出开销，进一步提升 SG2002 上的 ACT 推理速度。
+6. 已完成 TPU 热路径日志降级优化，将 StarryOS 上 ACT BF16 推理从约 240 ms/run 降至约 84 ms/run；后续仍可继续减少模型加载、ION buffer 分配、文件 IO 和非热路径日志开销。
 
 ## AI 工具使用说明
 
