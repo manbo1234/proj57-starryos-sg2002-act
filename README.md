@@ -13,6 +13,7 @@
 | StarryOS `/dev/cvi-tpu0` 与 `/dev/ion` 支持 | 已完成 |
 | StarryOS 官方 TPU 小模型运行 | 已完成 |
 | StarryOS ACT BF16 TPU 推理 | 已完成 |
+| StarryOS ACT mixed INT8/BF16 TPU 推理 | 已完成，详见 [`feat/mixed-int8-bf16`](https://github.com/manbo1234/proj57-starryos-sg2002-act/tree/feat/mixed-int8-bf16) 分支 |
 
 ## 技术路线
 
@@ -23,6 +24,7 @@ StarryOS/QEMU CPU 推理
 -> SG2002 官方 Linux 验证 TPU 推理正确性
 -> 在 StarryOS 中补齐 TPU/ION 设备支持
 -> 在 SG2002 StarryOS 中运行 ACT BF16 TPU 推理
+-> mixed INT8/BF16 量化与 StarryOS 板端验证
 ```
 
 ## 仓库内容
@@ -184,7 +186,7 @@ Outputs:
 Task exit with code: 0
 ```
 
-性能记录（优化前，TPU 热路径 info 日志开启）：
+早期性能记录（优化前，TPU 热路径 info 日志开启，非最终速度）：
 
 ```text
 run1: 239.647 ms, 4.172804 FPS
@@ -220,6 +222,55 @@ after : 3 runs take 253.313 ms, each run takes  84.437000 ms, fps 11.843149
 ```
 
 因此，StarryOS 上此前约 240 ms 的 ACT BF16 推理耗时主要由 TPU 热路径内核日志污染导致。关闭热路径 `info!` 日志后，ACT BF16 `cvimodel` 在 SG2002 StarryOS 上的推理速度达到约 84 ms/run，接近 SG2002 官方 Linux 上约 83 ms/run 的结果。
+
+### mixed INT8/BF16 推理记录
+
+在 BF16 模型已经跑通的基础上，进一步使用 TPU-MLIR 对 ACT 模型进行了 mixed INT8/BF16 量化。该部分包括 calibration/test 数据导出、纯 INT8 精度观察、mixed INT8/BF16 qtable 搜索、`cvimodel` 部署、Docker 仿真验证以及 SG2002 StarryOS 板端输出对比。
+
+完整记录单独整理在分支：
+
+```text
+feat/mixed-int8-bf16
+```
+
+分支链接：
+
+```text
+https://github.com/manbo1234/proj57-starryos-sg2002-act/tree/feat/mixed-int8-bf16
+```
+
+混合量化结果摘要：
+
+```text
+pure INT8 outputs_cos       : 0.984688
+mixed INT8/BF16 outputs_cos : 0.9999107254577259
+BF16 model size             : about 96 MB
+mixed INT8/BF16 model size  : about 85 MB
+BF16 board runtime          : about 84 ms/run, 11.84 FPS
+mixed board runtime         : about 68-71 ms/run, about 14 FPS
+```
+
+SG2002 StarryOS 板端实测：
+
+```text
+000000: 10 runs take 681.513 ms, each run takes 68.151 ms, fps 14.673299
+000227: 10 runs take 681.393 ms, each run takes 68.139 ms, fps 14.675883
+```
+
+板端输出与 TPU-MLIR Docker 仿真输出对比：
+
+```text
+000000: max_abs_diff=0.0, mean_abs_diff=0.0, cosine=1.0
+000227: max_abs_diff=0.0, mean_abs_diff=0.0, cosine=0.9999998807907104
+```
+
+mixed INT8/BF16 模型在板端运行时的主要 ION carveout 申请为：
+
+```text
+ION alloc_buffer request: size=87399632, align=1, heap_type=Carveout
+```
+
+相比纯 BF16 模型约 `98,799,760 bytes` 的 ION carveout 申请，mixed INT8/BF16 模型的模型体积、推理耗时和连续内存压力都有下降。
 
 ## 板端内存占用
 
